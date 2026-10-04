@@ -1071,15 +1071,12 @@ def geocode_zip(zip_code: str) -> tuple[float, float] | None:
 
 def _overpass(query: str) -> list[dict] | None:
     payload = urllib.parse.urlencode({"data": query}).encode()
-    # The public map sometimes times out. Retry the same query once, then one backup.
+    # One short try on each public map server. A long retry made the search give up.
     attempts = (
-        ("https://overpass-api.de/api/interpreter", 25),
-        ("https://overpass-api.de/api/interpreter", 25),
-        ("https://overpass.kumi.systems/api/interpreter", 20),
+        ("https://overpass-api.de/api/interpreter", 12),
+        ("https://overpass.osm.ch/api/interpreter", 12),
     )
-    for index, (endpoint, timeout) in enumerate(attempts):
-        if index:
-            time.sleep(2)
+    for endpoint, timeout in attempts:
         req = urllib.request.Request(
             endpoint,
             data=payload,
@@ -1096,22 +1093,7 @@ def _overpass(query: str) -> list[dict] | None:
     return None
 
 
-def nearby_dealer_sites(lat: float, lon: float, radius_miles: float) -> tuple[list[dict], str | None]:
-    key = (round(lat, 2), round(lon, 2), int(radius_miles))
-    with _CACHE_LOCK:
-        cached = _DEALER_CACHE.get(key)
-    if cached is not None:
-        return cached, None
-    meters = int(radius_miles * 1609.344)
-    # One tag keeps the public map query small enough to answer. A heavier query times out.
-    query = (
-        f'[out:json][timeout:25];'
-        f'nwr["shop"="car"]["website"](around:{meters},{lat},{lon});'
-        f'out tags center;'
-    )
-    elements = _overpass(query)
-    if elements is None:
-        return [], "Couldn't look up nearby dealer websites."
+def _dealer_rows_from_elements(elements: list[dict], lat: float, lon: float, radius_miles: float) -> list[dict]:
     dealers: list[dict] = []
     seen_hosts: set[str] = set()
     for el in elements:
@@ -1133,18 +1115,114 @@ def nearby_dealer_sites(lat: float, lon: float, radius_miles: float) -> tuple[li
         if miles > radius_miles + 0.5:
             continue
         seen_hosts.add(host)
-        name = (tags.get("name") or host).strip()
         dealers.append({
-            "name": name,
+            "name": (tags.get("name") or host).strip(),
             "city": (tags.get("addr:city") or "").strip(),
             "state": (tags.get("addr:state") or "").strip(),
             "miles": round(miles, 1),
             "origin": origin,
             "host": host,
         })
-    dealers.sort(key=lambda row: row["miles"])
+    return dealers
+
+
+def _nominatim_dealers(lat: float, lon: float, radius_miles: float) -> list[dict]:
+    """Dealer websites from the public map directory. Used when the map query fails."""
+    import math
+    dlat = radius_miles / 69.0
+    dlon = radius_miles / (69.0 * max(0.2, math.cos(math.radians(lat))))
+    headers = {"User-Agent": "carbuyingagents/1.0 (dealer search)", "Accept": "application/json"}
+    search_url = "https://nominatim.openstreetmap.org/search?" + urllib.parse.urlencode({
+        "q": "[shop=car]",
+        "format": "jsonv2",
+        "limit": "40",
+        "viewbox": f"{lon - dlon},{lat + dlat},{lon + dlon},{lat - dlat}",
+        "bounded": "1",
+    })
+    try:
+        time.sleep(1)
+        req = urllib.request.Request(search_url, headers=headers)
+        with urllib.request.urlopen(req, timeout=12) as resp:
+            found = json.loads(resp.read().decode("utf-8", "replace"))
+    except Exception:
+        return []
+    if not isinstance(found, list) or not found:
+        return []
+    prefix = {"node": "N", "way": "W", "relation": "R"}
+    osm_ids = []
+    for row in found:
+        kind = prefix.get(row.get("osm_type") or "")
+        if kind and row.get("osm_id"):
+            osm_ids.append(f"{kind}{row['osm_id']}")
+    if not osm_ids:
+        return []
+    lookup_url = "https://nominatim.openstreetmap.org/lookup?" + urllib.parse.urlencode({
+        "osm_ids": ",".join(osm_ids),
+        "format": "jsonv2",
+        "extratags": "1",
+        "addressdetails": "1",
+    })
+    try:
+        time.sleep(1)
+        req = urllib.request.Request(lookup_url, headers=headers)
+        with urllib.request.urlopen(req, timeout=12) as resp:
+            rows = json.loads(resp.read().decode("utf-8", "replace"))
+    except Exception:
+        return []
+    if not isinstance(rows, list):
+        return []
+    elements = []
+    for row in rows:
+        tags = dict(row.get("extratags") or {})
+        address = row.get("address") or {}
+        if row.get("name") and not tags.get("name"):
+            tags["name"] = row["name"]
+        if address.get("city") or address.get("town") or address.get("village"):
+            tags["addr:city"] = address.get("city") or address.get("town") or address.get("village")
+        if address.get("state"):
+            tags["addr:state"] = address["state"]
+        try:
+            elements.append({
+                "tags": tags,
+                "lat": float(row["lat"]),
+                "lon": float(row["lon"]),
+            })
+        except (KeyError, TypeError, ValueError):
+            continue
+    return _dealer_rows_from_elements(elements, lat, lon, radius_miles)
+
+
+def nearby_dealer_sites(lat: float, lon: float, radius_miles: float) -> tuple[list[dict], str | None]:
+    key = (round(lat, 2), round(lon, 2), int(radius_miles))
     with _CACHE_LOCK:
-        _DEALER_CACHE[key] = dealers
+        cached = _DEALER_CACHE.get(key)
+    if cached is not None:
+        return cached, None
+    # A shorter radius answers more often. The directory search still covers the full radius.
+    meters = int(min(radius_miles, 25) * 1609.344)
+    query = (
+        f'[out:json][timeout:12];'
+        f'nwr["shop"="car"]["website"](around:{meters},{lat},{lon});'
+        f'out tags center;'
+    )
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        map_future = pool.submit(_overpass, query)
+        directory_future = pool.submit(_nominatim_dealers, lat, lon, radius_miles)
+        elements = map_future.result()
+        directory = directory_future.result()
+    dealers = _dealer_rows_from_elements(elements or [], lat, lon, radius_miles)
+    seen = {row["host"] for row in dealers}
+    for row in directory:
+        if row["host"] in seen:
+            continue
+        seen.add(row["host"])
+        dealers.append(row)
+    if not dealers and elements is None:
+        return [], "Couldn't look up nearby dealer websites."
+    dealers.sort(key=lambda row: row["miles"])
+    if dealers:
+        with _CACHE_LOCK:
+            _DEALER_CACHE[key] = dealers
     return dealers, None
 
 
