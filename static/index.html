@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Dealer cars near you</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <div class="page">
+    <header class="site-header">
+      <a class="brand" href="/">
+        <span class="brand-mark" aria-hidden="true"></span>
+        <span class="brand-text">Dealer cars near you</span>
+      </a>
+      <nav class="account-nav" aria-label="Account">
+        <span id="account-label" class="account-label" hidden></span>
+        <button type="button" id="account-btn" class="link-btn">Account</button>
+        <button type="button" id="signout-btn" class="link-btn" hidden>Sign out</button>
+      </nav>
+    </header>
+
+    <main class="wrap">
+      <section class="hero">
+        <p class="eyebrow">Used dealer inventory</p>
+        <h1>Find cars on real dealer lots near your ZIP.</h1>
+        <p class="sub">Search by budget. We keep dealer listings and skip junk prices, private sellers, and ad landers.</p>
+      </section>
+
+      <form id="search-form" class="search-card">
+        <div class="search-card-head">
+          <h2>Search</h2>
+          <p>ZIP, max budget, optional body style.</p>
+        </div>
+        <div class="grid">
+          <label>
+            ZIP code
+            <input name="zip" type="text" inputmode="numeric" pattern="\d{5}" maxlength="5" placeholder="02332" required autocomplete="postal-code" />
+          </label>
+          <label>
+            Max budget
+            <input name="budget" type="number" min="1" step="500" placeholder="48000" required />
+          </label>
+          <label>
+            Body <span class="opt">optional</span>
+            <select name="body">
+              <option value="suv" selected>SUV</option>
+              <option value="any">Any</option>
+              <option value="sedan">Sedan</option>
+              <option value="truck">Truck</option>
+              <option value="coupe">Coupe</option>
+              <option value="hatchback">Hatchback</option>
+              <option value="van">Van</option>
+              <option value="wagon">Wagon</option>
+              <option value="convertible">Convertible</option>
+            </select>
+          </label>
+        </div>
+        <div class="actions">
+          <button type="submit" id="go" class="primary">Search</button>
+        </div>
+      </form>
+
+      <p id="status" class="status" aria-live="polite"></p>
+      <section id="results" class="results"></section>
+    </main>
+  </div>
+
+  <div id="auth-modal" class="modal" hidden>
+    <div class="modal-backdrop" data-close-auth></div>
+    <div class="modal-panel" role="dialog" aria-modal="true" aria-labelledby="auth-title">
+      <button type="button" class="modal-close" data-close-auth aria-label="Close">&times;</button>
+
+      <div id="auth-forms">
+        <div class="auth-tabs" role="tablist">
+          <button type="button" class="auth-tab is-active" data-auth-tab="signup" role="tab" aria-selected="true">Create account</button>
+          <button type="button" class="auth-tab" data-auth-tab="login" role="tab" aria-selected="false">Sign in</button>
+        </div>
+
+        <form id="signup-form" class="auth-form">
+          <h2 id="auth-title">Create account</h2>
+          <p class="auth-lead">Save searches later. Local accounts only for now.</p>
+          <label>
+            Name
+            <input name="name" type="text" required maxlength="80" autocomplete="name" />
+          </label>
+          <label>
+            Email
+            <input name="email" type="email" required autocomplete="email" />
+          </label>
+          <label>
+            Password
+            <input name="password" type="password" required minlength="8" autocomplete="new-password" />
+          </label>
+          <p class="auth-hint">At least 8 characters. You’ll confirm your email next.</p>
+          <p id="signup-error" class="form-error" hidden></p>
+          <button type="submit" class="primary">Create account</button>
+        </form>
+
+        <form id="login-form" class="auth-form" hidden>
+          <h2>Sign in</h2>
+          <p class="auth-lead">Use the email you confirmed.</p>
+          <label>
+            Email
+            <input name="email" type="email" required autocomplete="email" />
+          </label>
+          <label>
+            Password
+            <input name="password" type="password" required minlength="8" autocomplete="current-password" />
+          </label>
+          <p id="login-error" class="form-error" hidden></p>
+          <button type="submit" class="primary">Sign in</button>
+        </form>
+      </div>
+
+      <div id="check-email" class="check-email" hidden>
+        <h2>Check your email</h2>
+        <p class="auth-lead">We need you to confirm <strong id="pending-email"></strong> before you can sign in.</p>
+        <div class="local-standin">
+          <p class="standin-label">Local stand-in (no email was sent)</p>
+          <p>Use this link to activate the account:</p>
+          <a id="confirm-link" class="confirm-link" href="#">Confirm email</a>
+        </div>
+        <button type="button" class="ghost" data-close-auth>Back to search</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>
