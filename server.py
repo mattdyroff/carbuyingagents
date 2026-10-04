@@ -1871,7 +1871,9 @@ def attach_consumer_details(listings: list[dict], budget: int) -> None:
 
 
 def listing_sort_key(item: dict, budget: int) -> tuple:
-    return (-(item.get("year") or 0), abs(budget - item["price"]), item["price"])
+    # Dealer-site cars stay ahead of the CarGurus fill-in.
+    from_dealer = 0 if item.get("listing_source") == "dealer_site" else 1
+    return (from_dealer, -(item.get("year") or 0), abs(budget - item["price"]), item["price"])
 
 
 def search_market(
