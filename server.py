@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Dealer car search. Proxies unhuman.autos and keeps real used dealer listings."""
+"""Dealer car search. Reads a public CarGurus results page for nearby dealer listings."""
 
 from __future__ import annotations
 
@@ -23,12 +23,13 @@ ROOT = Path(__file__).resolve().parent
 STATIC = ROOT / "static"
 DATA = ROOT / "data"
 DB_PATH = DATA / "accounts.db"
-UPSTREAM = "https://unhuman.autos/api/cars"
-UA = "DealerCarsNearYou/1.0 (+local product)"
+CG_SEARCH = "https://www.cargurus.com/search"
+UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+)
 CURRENT_YEAR = date.today().year
 RESULT_LIMIT = 8
-PAGE_ROWS = 50
-MAX_PAGES = 2
 ABSOLUTE_MIN_PRICE = 5000
 SESSION_COOKIE = "carshop_session"
 PBKDF2_ITERATIONS = 260000
@@ -69,6 +70,29 @@ MAKE_MAP = {
     "chevy": "chevrolet",
     "vw": "volkswagen",
     "mercedes": "mercedes-benz",
+}
+
+
+BODY_GROUP = {
+    "suv": "7",
+    "sedan": "6",
+    "truck": "5",
+    "coupe": "0",
+    "convertible": "1",
+    "hatchback": "3",
+    "van": "4",
+    "wagon": "9",
+}
+
+BODY_WORDS = {
+    "suv": ("suv", "crossover"),
+    "sedan": ("sedan",),
+    "truck": ("truck", "pickup"),
+    "coupe": ("coupe",),
+    "convertible": ("convertible",),
+    "hatchback": ("hatchback",),
+    "van": ("van",),
+    "wagon": ("wagon",),
 }
 
 AD_HOSTS = (
@@ -385,75 +409,258 @@ def normalize_listing(raw: dict, budget: int) -> dict | None:
     }
 
 
-def fetch_page(params: dict) -> dict:
-    qs = urllib.parse.urlencode({k: v for k, v in params.items() if v is not None and v != ""})
-    url = f"{UPSTREAM}?{qs}"
-    req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "application/json"})
+def body_matches(body_name: str | None, wanted: str) -> bool:
+    if not wanted:
+        return True
+    text = (body_name or "").casefold()
+    return any(word in text for word in BODY_WORDS.get(wanted, (wanted,)))
+
+
+def looks_blocked(html: str) -> bool:
+    if "LISTING_" in html:
+        return False
+    head = html[:4000].casefold()
+    markers = (
+        "just a moment",
+        "page unavailable",
+        "access denied",
+        "captcha",
+        "verify you are human",
+    )
+    return any(marker in head for marker in markers)
+
+
+def fetch_html(url: str) -> dict:
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": UA,
+            "Accept": "text/html,application/xhtml+xml",
+            "Accept-Language": "en-US,en;q=0.9",
+        },
+    )
     try:
         with urllib.request.urlopen(req, timeout=25) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
+            html = resp.read().decode("utf-8", "replace")
     except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8", errors="replace")[:500]
-        return {"ok": False, "error": f"Upstream HTTP {e.code}: {body}", "listings": []}
-    except Exception as e:  # noqa: BLE001
-        return {"ok": False, "error": f"Upstream fetch failed: {e}", "listings": []}
-    return {"ok": True, "listings": data.get("listings") or [], "query": qs}
+        if e.code in (403, 429, 503):
+            return {
+                "ok": False,
+                "error": "The listing site blocked this search. Try again later.",
+                "html": "",
+            }
+        return {"ok": False, "error": "The listing site didn't return listings.", "html": ""}
+    except Exception:
+        return {
+            "ok": False,
+            "error": "Couldn't reach the listing site. Try again in a minute.",
+            "html": "",
+        }
+    if looks_blocked(html):
+        return {
+            "ok": False,
+            "error": "The listing site blocked this search. Try again later.",
+            "html": "",
+        }
+    return {"ok": True, "html": html, "error": None}
+
+
+def make_paths(html: str) -> dict[str, str]:
+    found: dict[str, str] = {}
+    for label, value in re.findall(r'"label":"([^"\\]+)","value":"(m\d+)"', html):
+        found[label.casefold()] = value
+    return found
+
+
+def parse_cargurus_listings(html: str) -> list[dict]:
+    decoder = json.JSONDecoder()
+    rows: list[dict] = []
+    idx = 0
+    needle = '{"type":"LISTING_'
+    while True:
+        i = html.find(needle, idx)
+        if i < 0:
+            break
+        try:
+            obj, end = decoder.raw_decode(html, i)
+        except json.JSONDecodeError:
+            idx = i + len(needle)
+            continue
+        idx = end
+        data = obj.get("data") if isinstance(obj, dict) else None
+        if isinstance(data, dict):
+            rows.append(data)
+    return rows
+
+
+def cargurus_to_raw(data: dict) -> dict | None:
+    seller = data.get("sellerData") or {}
+    dealer_name = (seller.get("serviceProviderName") or "").strip()
+    if not dealer_name:
+        return None
+    listing_id = data.get("id")
+    if not listing_id:
+        return None
+    ont = data.get("ontologyData") or {}
+    price = (data.get("priceData") or {}).get("current")
+    miles = (data.get("mileageData") or {}).get("value")
+    dist = data.get("distance")
+    if isinstance(dist, (int, float)):
+        dist = round(float(dist), 1)
+    year = ont.get("carYear")
+    make = ont.get("makeName") or ""
+    model = ont.get("modelName") or ""
+    title = (data.get("listingTitle") or "").strip()
+    if not title:
+        title = " ".join(str(part) for part in (year, make, model) if part)
+    return {
+        "seller_type": "dealer",
+        "inventory_type": "new" if data.get("isNew") else "used",
+        "dealer": {
+            "name": dealer_name,
+            "city": (seller.get("city") or "").strip(),
+            "state": (seller.get("region") or "").strip(),
+        },
+        "vin": data.get("vin") or "",
+        "vdp_url": f"https://www.cargurus.com/details/{listing_id}",
+        "price": price,
+        "build": {
+            "year": year,
+            "make": make,
+            "model": model,
+            "body_type": ont.get("bodyTypeName"),
+        },
+        "heading": title,
+        "miles": miles,
+        "dist": dist,
+        "make": make,
+        "model": model,
+        "year": year,
+        "body_type": ont.get("bodyTypeName"),
+    }
+
+
+def search_url(base_params: dict, budget: int, make_path: str | None = None) -> str:
+    price_range = base_params.get("price_range") or ""
+    if "-" in str(price_range):
+        low, high = str(price_range).split("-", 1)
+    else:
+        low, high = str(price_floor(budget)), str(budget)
+    query = {
+        "zip": base_params.get("zip") or "",
+        "distance": base_params.get("radius") or "50",
+        "minPrice": low,
+        "maxPrice": high,
+        "sortType": "NEWEST_CAR_YEAR",
+        "sortDirection": "ASC",
+    }
+    inventory = (base_params.get("inventory_type") or "used").lower()
+    if inventory == "cpo":
+        query["newUsed"] = "8"
+    elif inventory != "new":
+        query["newUsed"] = "2"
+    body = base_params.get("body_type") or ""
+    if body in BODY_GROUP:
+        query["bodyTypeGroup"] = BODY_GROUP[body]
+    if base_params.get("year"):
+        query["startYear"] = base_params["year"]
+        query["endYear"] = base_params["year"]
+    miles = str(base_params.get("miles_range") or "")
+    if "-" in miles:
+        query["maxMileage"] = miles.split("-", 1)[1]
+    if make_path:
+        query["makeModelTrimPaths"] = make_path
+    return CG_SEARCH + "?" + urllib.parse.urlencode(query)
+
+
+def within_radius(raw: dict, radius: float) -> bool:
+    dist = raw.get("dist")
+    if dist is None:
+        return True
+    try:
+        return float(dist) <= radius + 0.5
+    except (TypeError, ValueError):
+        return True
 
 
 def select_listings(base_params: dict, budget: int) -> dict:
-    """Pull the closest-to-budget page, then keep a short useful set."""
-    kept: list[dict] = []
-    seen: set[tuple[str, str]] = set()
-    scanned = 0
-    dropped_new = 0
-    queries: list[str] = []
-    last_error = None
-
-    for page in range(MAX_PAGES):
-        params = dict(base_params)
-        params["rows"] = str(PAGE_ROWS)
-        params["start"] = str(page * PAGE_ROWS)
-        # Price descending so the page is the cars near the budget, not $2,000 beaters.
-        params["sort_by"] = "price"
-        params["sort_order"] = "desc"
-        params["inventory_type"] = "used"
-        page_data = fetch_page(params)
-        if not page_data.get("ok"):
-            last_error = page_data.get("error")
-            if page == 0:
+    """Read one public results page and keep a short used-dealer set."""
+    url = search_url(base_params, budget)
+    page = fetch_html(url)
+    if not page.get("ok"):
+        return {
+            "ok": False,
+            "error": page.get("error") or "Couldn't load dealer listings.",
+            "listings": [],
+            "queries": [url],
+        }
+    html = page["html"]
+    make = (base_params.get("make") or "").casefold()
+    if make:
+        path = make_paths(html).get(make)
+        if path:
+            url = search_url(base_params, budget, make_path=path)
+            page = fetch_html(url)
+            if not page.get("ok"):
                 return {
                     "ok": False,
-                    "error": last_error,
+                    "error": page.get("error") or "Couldn't load dealer listings.",
                     "listings": [],
-                    "queries": queries,
+                    "queries": [url],
                 }
-            break
-        queries.append(page_data.get("query") or "")
-        rows = page_data["listings"]
-        scanned += len(rows)
-        for raw in rows:
-            if (raw.get("inventory_type") or "").strip().lower() == "new":
-                dropped_new += 1
-            item = normalize_listing(raw, budget)
-            if not item:
-                continue
-            key = (item["name"].casefold(), item["dealer"].casefold())
-            if key in seen:
-                continue
-            seen.add(key)
-            kept.append(item)
-        if len(rows) < PAGE_ROWS or len(kept) >= RESULT_LIMIT:
-            break
+            html = page["html"]
+
+    wanted_body = base_params.get("body_type") or ""
+    wanted_model = (base_params.get("model") or "").casefold()
+    try:
+        radius = float(base_params.get("radius") or 50)
+    except (TypeError, ValueError):
+        radius = 50.0
+    kept: list[dict] = []
+    seen: set[str] = set()
+    scanned = 0
+    dropped_new = 0
+    for data in parse_cargurus_listings(html):
+        raw = cargurus_to_raw(data)
+        if not raw:
+            continue
+        scanned += 1
+        if raw["inventory_type"] == "new":
+            dropped_new += 1
+        if not within_radius(raw, radius):
+            continue
+        if wanted_body and not body_matches(raw.get("body_type"), wanted_body):
+            continue
+        got_make = (raw.get("make") or "").casefold()
+        if make and got_make != make and make not in got_make:
+            continue
+        if wanted_model and wanted_model not in (raw.get("model") or "").casefold():
+            continue
+        item = normalize_listing(raw, budget)
+        if not item:
+            continue
+        if item["vin"] in seen:
+            continue
+        seen.add(item["vin"])
+        kept.append(item)
 
     kept.sort(key=lambda item: (-(item.get("year") or 0), abs(budget - item["price"]), item["price"]))
     chosen = kept[:RESULT_LIMIT]
+    real_page = ("LISTING_" in html) or ("minPrice" in html) or ("BODY_TYPE_GROUP" in html)
+    if not chosen and not real_page:
+        return {
+            "ok": False,
+            "error": "The listing site didn't include any listings.",
+            "listings": [],
+            "queries": [url],
+        }
     return {
         "ok": True,
         "listings": chosen,
         "scanned": scanned,
         "dropped_new": dropped_new,
-        "queries": queries,
-        "error": last_error,
+        "queries": [url],
+        "error": None,
     }
 
 
@@ -540,7 +747,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/search":
             return self._handle_search(parsed.query)
         if path == "/api/health":
-            return self._json(200, {"ok": True, "source": UPSTREAM})
+            return self._json(200, {"ok": True, "source": CG_SEARCH})
         if path == "/api/me":
             user = self._current_user()
             return self._json(200, {"ok": True, "user": user})
@@ -764,7 +971,7 @@ class Handler(BaseHTTPRequestHandler):
                 "ok": True,
                 "listings": [],
                 "note": "Found 0 dealer listings.",
-                "source": "US dealer inventory",
+                "source": "CarGurus public dealer listings",
                 "filters": {
                     "budget": budget,
                     "zip": zip_code,
@@ -798,7 +1005,7 @@ class Handler(BaseHTTPRequestHandler):
             "ok": bool(selected.get("ok")),
             "listings": listings,
             "note": f"Found {count} dealer {noun}.",
-            "source": "US dealer inventory",
+            "source": "CarGurus public dealer listings",
             "filters": {
                 "budget": budget,
                 "zip": zip_code,
@@ -823,7 +1030,7 @@ def main():
     init_db()
     httpd = Server((HOST, PORT), Handler)
     print(f"Dealer cars running at http://{HOST}:{PORT}/")
-    print(f"Listings source: {UPSTREAM}")
+    print(f"Listings source: {CG_SEARCH}")
     print(f"Accounts DB: {DB_PATH}")
     httpd.serve_forever()
 
