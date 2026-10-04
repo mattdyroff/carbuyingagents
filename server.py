@@ -1,17 +1,21 @@
 #!/usr/bin/env python3
-"""Dealer car search. Reads a public CarGurus results page for nearby dealer listings."""
+"""Dealer car search. Reads nearby dealer inventory pages, then CarGurus if those pages do not fill the list."""
 
 from __future__ import annotations
 
 import hashlib
+import html as html_lib
 import json
 import os
 import re
 import secrets
 import sqlite3
+import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timezone
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -616,6 +620,816 @@ def within_radius(raw: dict, radius: float) -> bool:
         return True
 
 
+DEALER_FETCH_LIMIT = 40
+DEALER_WAVE = 6
+DEALER_WORKERS = 5
+DEALER_PAGE_TIMEOUT = 12
+RADIUS_METERS = 80467
+_CACHE_LOCK = threading.Lock()
+_GEO_CACHE: dict[str, tuple[float, float] | None] = {}
+_DEALER_CACHE: dict[tuple[float, float], list[dict]] = {}
+
+# Skip directories and brand homepages. A dealer site that answers 403 is skipped later.
+SKIP_SITE_HOSTS = AD_HOSTS + OEM_HOSTS + (
+    "cargurus.com", "cars.com", "autotrader.com", "edmunds.com", "carfax.com",
+    "yelp.com", "bbb.org", "yellowpages.com", "tesla.com", "rivian.com",
+    "truecar.com", "kbb.com", "carvana.com",
+)
+
+LISTING_INDEX = re.compile(
+    r"newandusedcars|used-inventory|used-vehicles|/inventory(?:[/?#]|$)|cars-for-sale|used_cars|searchused",
+    re.I,
+)
+
+# When a dealer page has no body-style field, match the model name.
+SUV_MODELS = (
+    "rav4", "cr-v", "crv", "hr-v", "hrv", "pilot", "passport", "mdx", "rdx",
+    "cx-5", "cx-50", "cx-9", "cx-90", "cx-30", "cx5", "cx9", "tucson", "santa fe",
+    "palisade", "venue", "kona", "sportage", "sorento", "telluride", "seltos",
+    "niro", "rogue", "murano", "pathfinder", "armada", "explorer", "escape",
+    "edge", "expedition", "bronco", "equinox", "traverse", "tahoe", "suburban",
+    "blazer", "trailblazer", "trax", "outback", "forester", "crosstrek", "ascent",
+    "wrangler", "grand cherokee", "cherokee", "compass", "renegade", "durango",
+    "glc", "gle", "gls", "gla", "glb", "macan", "cayenne", "q3", "q5", "q7", "q8",
+    "x1", "x3", "x5", "x7", "model y", "ioniq 5", "ev6", "id.4", "atlas", "tiguan",
+    "taos", "enclave", "encore", "envision", "xt4", "xt5", "xt6", "escalade",
+    "highlander", "4runner", "sequoia", "venza", "corolla cross", "outlander",
+    "eclipse cross", "navigator", "aviator", "corsair", "nautilus", "discovery",
+    "range rover", "defender", "xc40", "xc60", "xc90", "gv70", "gv80", "rx350",
+    "rx450", "nx", "gx", "lx", "ux", "mdx", "rdx", "cayenne", "levante",
+    "stelvio", "urus", "bentayga", "cullinan", "dbx",
+)
+
+VIN_TRANSLIT = {
+    **{str(i): i for i in range(10)},
+    **dict(zip(
+        "ABCDEFGHJKLMNPRSTUVWXYZ",
+        [1, 2, 3, 4, 5, 6, 7, 8, 1, 2, 3, 4, 5, 7, 9, 2, 3, 4, 5, 6, 7, 8, 9],
+    )),
+}
+VIN_WEIGHTS = [8, 7, 6, 5, 4, 3, 2, 10, 0, 9, 8, 7, 6, 5, 4, 3, 2]
+
+
+def vin_check_digit(vin: str) -> bool:
+    """17-character VIN whose check digit matches. Drops random strings."""
+    vin = vin.strip().upper()
+    if not is_real_vin(vin):
+        return False
+    total = 0
+    for index, char in enumerate(vin):
+        value = VIN_TRANSLIT.get(char)
+        if value is None:
+            return False
+        total += value * VIN_WEIGHTS[index]
+    check = total % 11
+    expected = "X" if check == 10 else str(check)
+    return vin[8] == expected
+
+
+def haversine_miles(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    import math
+    radius = 3958.8
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    a = math.sin(dlat / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dlon / 2) ** 2
+    return 2 * radius * math.asin(min(1.0, math.sqrt(a)))
+
+
+def site_host(url: str) -> str:
+    return urllib.parse.urlsplit(url).netloc.lower().split(":")[0].rstrip(".")
+
+
+def skip_directory_site(url: str) -> bool:
+    host = site_host(url)
+    if not host:
+        return True
+    return any(host_is(host, name) for name in SKIP_SITE_HOSTS)
+
+
+def site_origin(url: str) -> str | None:
+    raw = (url or "").strip()
+    if not raw:
+        return None
+    if not raw.startswith(("http://", "https://")):
+        raw = "https://" + raw
+    parts = urllib.parse.urlsplit(raw)
+    host = parts.netloc.lower().split(":")[0]
+    if not host or "." not in host:
+        return None
+    scheme = parts.scheme if parts.scheme in ("http", "https") else "https"
+    return f"{scheme}://{host}/"
+
+
+def is_wall(html: str) -> bool:
+    """Bot wall or captcha page. A page that already lists VINs is not a wall."""
+    if not html or not html.strip():
+        return False
+    sample = html[:8000].casefold()
+    markers = (
+        "captcha-delivery.com",
+        "please enable js and disable any ad blocker",
+        "cf-browser-verification",
+        "just a moment",
+        "attention required",
+        "verify you are human",
+        "access denied",
+        "/cdn-cgi/challenge",
+    )
+    if not any(marker in sample for marker in markers):
+        return False
+    folded = html.casefold()
+    if "hdndwinventorylist" in folded or folded.count("optvin") >= 1:
+        return False
+    if len(re.findall(r"\b[A-HJ-NPR-Z0-9]{17}\b", html[:200000])) >= 2:
+        return False
+    return True
+
+
+def fetch_public(url: str) -> dict:
+    """Plain GET of a public page. A 403 or captcha is a skip, not a retry."""
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": UA,
+            "Accept": "text/html,application/xhtml+xml",
+            "Accept-Language": "en-US,en;q=0.9",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=DEALER_PAGE_TIMEOUT) as resp:
+            html = resp.read(2_000_000).decode("utf-8", "replace")
+            final = resp.geturl()
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 403, 429, 503):
+            return {"ok": False, "blocked": True, "html": "", "url": url, "error": "blocked"}
+        return {"ok": False, "blocked": False, "html": "", "url": url, "error": "empty"}
+    except Exception:
+        return {"ok": False, "blocked": False, "html": "", "url": url, "error": "unreachable"}
+    if is_wall(html):
+        return {"ok": False, "blocked": True, "html": "", "url": final, "error": "blocked"}
+    return {"ok": True, "blocked": False, "html": html, "url": final, "error": None}
+
+
+def classify_body(*parts: str) -> str:
+    text = " ".join(part for part in parts if part).casefold()
+    if not text:
+        return ""
+    if any(word in text for word in ("sport utility", "suv", "crossover")):
+        return "suv"
+    if any(word in text for word in ("pickup", "pick-up", "truck", "crew cab", "extended cab", "regular cab", "supercrew")):
+        return "truck"
+    for body, words in BODY_WORDS.items():
+        if body in ("suv", "truck"):
+            continue
+        if any(re.search(rf"\b{re.escape(word)}\b", text) for word in words):
+            return body
+    for model in SUV_MODELS:
+        if re.search(rf"\b{re.escape(model)}\b", text):
+            return "suv"
+    return ""
+
+
+def absolute_url(page_url: str, href: str) -> str:
+    return urllib.parse.urljoin(page_url, html_lib.unescape(href.strip()))
+
+
+def inventory_index_links(html: str, page_url: str) -> list[str]:
+    origin = site_host(page_url)
+    found: list[str] = []
+    for href in re.findall(r'href=["\']([^"\']+)["\']', html, re.I):
+        if href.startswith(("javascript:", "mailto:", "#", "tel:")):
+            continue
+        abs_url = absolute_url(page_url, href).split("#", 1)[0]
+        if site_host(abs_url) != origin:
+            continue
+        if not LISTING_INDEX.search(abs_url):
+            continue
+        if "/vdp/" in abs_url.casefold():
+            continue
+        if abs_url not in found:
+            found.append(abs_url)
+    return found[:3]
+
+
+def _new_flag(value) -> bool:
+    if value is True:
+        return True
+    if isinstance(value, str) and value.strip().casefold() in {"new", "n", "true", "1"}:
+        return True
+    return False
+
+
+def parse_dealerweb(html: str, page_url: str) -> list[dict]:
+    marker = html.find("hdnDWInventoryList")
+    if marker < 0:
+        return []
+    chunk = html[marker:marker + 500000]
+    start = chunk.find("{")
+    if start < 0:
+        return []
+    payload = chunk[start:]
+    try:
+        data, _end = json.JSONDecoder().raw_decode(payload)
+    except json.JSONDecodeError:
+        try:
+            data, _end = json.JSONDecoder().raw_decode(html_lib.unescape(payload))
+        except json.JSONDecodeError:
+            return []
+    cars = data.get("InvPageList") if isinstance(data, dict) else None
+    if not isinstance(cars, list):
+        return []
+    rows: list[dict] = []
+    for car in cars:
+        if not isinstance(car, dict):
+            continue
+        vin = str(car.get("Vin") or "").strip().upper()
+        if not vin_check_digit(vin):
+            continue
+        price = as_int(car.get("InternetPrice"))
+        if price is None or price < 1000:
+            price = as_int(car.get("SuggSalePrice"))
+        if price is None or price < 1000:
+            continue
+        year = as_int(car.get("Year"))
+        make = str(car.get("Make") or "").strip()
+        model = str(car.get("Model") or "").strip()
+        trim = str(car.get("Trim") or "").strip()
+        body = classify_body(str(car.get("BodyType") or ""), model, trim)
+        title = " ".join(part for part in (str(year or ""), make, model, trim) if part).strip()
+        detail = str(car.get("InventoryDetailURL") or "").strip()
+        url = absolute_url(page_url, detail) if detail else ""
+        token = str(car.get("URLEncodedEncrInvID") or "").strip()
+        if not url and token:
+            match = re.search(r'href="([^"]*' + re.escape(token) + r'[^"]*)"', html)
+            if match:
+                url = absolute_url(page_url, match.group(1))
+        if not url:
+            vin_at = html.find(vin)
+            if vin_at >= 0:
+                region = html[vin_at:vin_at + 2500]
+                match = re.search(r'href="(https?://[^"]+)"', region)
+                if match:
+                    url = absolute_url(page_url, match.group(1))
+        if not url.startswith(("http://", "https://")):
+            continue
+        rows.append({
+            "vin": vin,
+            "price": price,
+            "year": year,
+            "make": make,
+            "model": model,
+            "trim": trim,
+            "body": body,
+            "title": title,
+            "miles": as_int(car.get("Miles")),
+            "url": url,
+            "inventory_type": "new" if _new_flag(car.get("NewOrUsed")) else "used",
+        })
+    return rows
+
+
+def parse_dealer_car_search(html: str, page_url: str) -> list[dict]:
+    if "/vdp/" not in html:
+        return []
+    ordered: list[tuple[int, str]] = []
+    seen: set[str] = set()
+    for match in re.finditer(r"/vdp/(\d+)/", html):
+        vid = match.group(1)
+        if vid in seen:
+            continue
+        seen.add(vid)
+        ordered.append((match.start(), vid))
+    rows: list[dict] = []
+    for index, (pos, vid) in enumerate(ordered):
+        end = ordered[index + 1][0] if index + 1 < len(ordered) else pos + 8000
+        window = html[max(0, pos - 500): min(end, pos + 8000)]
+        path_match = re.search(rf'href="([^"]*/vdp/{vid}/[^"]*)"', window)
+        if not path_match:
+            continue
+        path = html_lib.unescape(path_match.group(1))
+        path_l = path.casefold()
+        if re.search(r"/new-|new-\d{4}", path_l):
+            inventory = "new"
+        else:
+            inventory = "used"
+        vin_match = re.search(r"\b([A-HJ-NPR-Z0-9]{17})\b", window)
+        if not vin_match or not vin_check_digit(vin_match.group(1)):
+            continue
+        price_match = re.search(
+            rf"compareChecked\(\s*this\s*,\s*'{vid}'\s*,\s*'\$([\d,]+)'",
+            html,
+        )
+        if not price_match:
+            price_match = re.search(r"\$\s?([\d,]{4,})", window)
+        if not price_match:
+            continue
+        price = as_int(price_match.group(1))
+        if price is None or price < 1000:
+            continue
+        title_match = re.search(rf'aria-label="([^"]+)"[^>]*href="[^"]*/vdp/{vid}/', window)
+        if not title_match:
+            title_match = re.search(rf'href="[^"]*/vdp/{vid}/[^"]*"[^>]*aria-label="([^"]+)"', window)
+        title = html_lib.unescape(title_match.group(1)) if title_match else ""
+        title = re.sub(r"\s+", " ", title).strip()
+        miles_match = re.search(r"Mileage:\s*</label>\s*([\d,]+)", window, re.S | re.I)
+        miles = as_int(miles_match.group(1)) if miles_match else None
+        year_match = re.search(r"\b(19\d{2}|20\d{2})\b", title)
+        year = int(year_match.group(1)) if year_match else None
+        body = classify_body(title, path)
+        rows.append({
+            "vin": vin_match.group(1).upper(),
+            "price": price,
+            "year": year,
+            "make": "",
+            "model": "",
+            "trim": "",
+            "body": body,
+            "title": title,
+            "miles": miles,
+            "url": absolute_url(page_url, path.split("?")[0]),
+            "inventory_type": inventory,
+        })
+    return rows
+
+
+def parse_jsonld_vehicles(html: str, page_url: str) -> list[dict]:
+    rows: list[dict] = []
+    for block in re.findall(
+        r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
+        html,
+        re.S | re.I,
+    ):
+        try:
+            data = json.loads(block.strip())
+        except json.JSONDecodeError:
+            continue
+        stack = data if isinstance(data, list) else [data]
+        flat: list[dict] = []
+        while stack:
+            item = stack.pop()
+            if isinstance(item, list):
+                stack.extend(item)
+                continue
+            if not isinstance(item, dict):
+                continue
+            if "@graph" in item and isinstance(item["@graph"], list):
+                stack.extend(item["@graph"])
+            flat.append(item)
+        for item in flat:
+            kind = item.get("@type") or ""
+            if isinstance(kind, list):
+                kind = " ".join(str(part) for part in kind)
+            if "vehicle" not in str(kind).casefold() and "car" not in str(kind).casefold():
+                continue
+            vin = str(item.get("vehicleIdentificationNumber") or "").strip().upper()
+            if not vin_check_digit(vin):
+                continue
+            offers = item.get("offers") or {}
+            if isinstance(offers, list):
+                offers = offers[0] if offers else {}
+            price = as_int(offers.get("price") if isinstance(offers, dict) else None)
+            if price is None:
+                price = as_int(item.get("price"))
+            if price is None or price < 1000:
+                continue
+            url = ""
+            if isinstance(offers, dict):
+                url = str(offers.get("url") or "")
+            if not url:
+                url = str(item.get("url") or "")
+            url = absolute_url(page_url, url) if url else ""
+            if not url.startswith(("http://", "https://")):
+                continue
+            year = as_int(item.get("vehicleModelDate") or item.get("modelDate") or item.get("releaseDate"))
+            make = item.get("brand") or item.get("manufacturer") or ""
+            if isinstance(make, dict):
+                make = make.get("name") or ""
+            model = str(item.get("model") or "").strip()
+            name = str(item.get("name") or "").strip()
+            body = classify_body(str(item.get("bodyType") or ""), name, model)
+            miles = None
+            odo = item.get("mileageFromOdometer")
+            if isinstance(odo, dict):
+                miles = as_int(odo.get("value"))
+            else:
+                miles = as_int(odo)
+            condition = str(item.get("itemCondition") or "").casefold()
+            inventory = "new" if "newcondition" in condition else "used"
+            rows.append({
+                "vin": vin,
+                "price": price,
+                "year": year,
+                "make": str(make or "").strip(),
+                "model": model,
+                "trim": "",
+                "body": body,
+                "title": name,
+                "miles": miles,
+                "url": url.split("?")[0],
+                "inventory_type": inventory,
+            })
+    return rows
+
+
+def parse_dealer_inventory(html: str, page_url: str) -> list[dict]:
+    rows = parse_dealerweb(html, page_url)
+    if rows:
+        return rows
+    rows = parse_dealer_car_search(html, page_url)
+    if rows:
+        return rows
+    return parse_jsonld_vehicles(html, page_url)
+
+
+def geocode_zip(zip_code: str) -> tuple[float, float] | None:
+    with _CACHE_LOCK:
+        if zip_code in _GEO_CACHE:
+            return _GEO_CACHE[zip_code]
+    url = "https://nominatim.openstreetmap.org/search?" + urllib.parse.urlencode({
+        "postalcode": zip_code,
+        "country": "us",
+        "format": "json",
+        "limit": "1",
+    })
+    req = urllib.request.Request(
+        url,
+        headers={"User-Agent": "carbuyingagents/1.0 (dealer search)", "Accept": "application/json"},
+    )
+    point = None
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode("utf-8", "replace"))
+        if data:
+            point = (float(data[0]["lat"]), float(data[0]["lon"]))
+    except Exception:
+        point = None
+    with _CACHE_LOCK:
+        _GEO_CACHE[zip_code] = point
+    return point
+
+
+def _overpass(query: str) -> list[dict] | None:
+    payload = urllib.parse.urlencode({"data": query}).encode()
+    # The public map sometimes times out. Retry the same query once, then one backup.
+    attempts = (
+        ("https://overpass-api.de/api/interpreter", 25),
+        ("https://overpass-api.de/api/interpreter", 25),
+        ("https://overpass.kumi.systems/api/interpreter", 20),
+    )
+    for index, (endpoint, timeout) in enumerate(attempts):
+        if index:
+            time.sleep(2)
+        req = urllib.request.Request(
+            endpoint,
+            data=payload,
+            headers={"User-Agent": "carbuyingagents/1.0 (public dealer search)"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                data = json.loads(resp.read().decode("utf-8", "replace"))
+            elements = data.get("elements")
+            if isinstance(elements, list):
+                return elements
+        except Exception:
+            continue
+    return None
+
+
+def nearby_dealer_sites(lat: float, lon: float, radius_miles: float) -> tuple[list[dict], str | None]:
+    key = (round(lat, 2), round(lon, 2), int(radius_miles))
+    with _CACHE_LOCK:
+        cached = _DEALER_CACHE.get(key)
+    if cached is not None:
+        return cached, None
+    meters = int(radius_miles * 1609.344)
+    # One tag keeps the public map query small enough to answer. A heavier query times out.
+    query = (
+        f'[out:json][timeout:25];'
+        f'nwr["shop"="car"]["website"](around:{meters},{lat},{lon});'
+        f'out tags center;'
+    )
+    elements = _overpass(query)
+    if elements is None:
+        return [], "Couldn't look up nearby dealer websites."
+    dealers: list[dict] = []
+    seen_hosts: set[str] = set()
+    for el in elements:
+        tags = el.get("tags") or {}
+        website = tags.get("website") or tags.get("contact:website") or ""
+        origin = site_origin(website)
+        if not origin or skip_directory_site(origin):
+            continue
+        host = site_host(origin)
+        if host in seen_hosts:
+            continue
+        center = el.get("center") or {}
+        el_lat = el.get("lat", center.get("lat"))
+        el_lon = el.get("lon", center.get("lon"))
+        try:
+            miles = haversine_miles(lat, lon, float(el_lat), float(el_lon))
+        except (TypeError, ValueError):
+            continue
+        if miles > radius_miles + 0.5:
+            continue
+        seen_hosts.add(host)
+        name = (tags.get("name") or host).strip()
+        dealers.append({
+            "name": name,
+            "city": (tags.get("addr:city") or "").strip(),
+            "state": (tags.get("addr:state") or "").strip(),
+            "miles": round(miles, 1),
+            "origin": origin,
+            "host": host,
+        })
+    dealers.sort(key=lambda row: row["miles"])
+    with _CACHE_LOCK:
+        _DEALER_CACHE[key] = dealers
+    return dealers, None
+
+
+def _raw_from_parsed(parsed: dict, dealer: dict) -> dict:
+    title = parsed.get("title") or ""
+    year = parsed.get("year")
+    make = parsed.get("make") or ""
+    model = parsed.get("model") or ""
+    if not title:
+        title = " ".join(str(part) for part in (year, make, model) if part).strip()
+    return {
+        "seller_type": "dealer",
+        "inventory_type": parsed.get("inventory_type") or "used",
+        "dealer": {
+            "name": dealer["name"],
+            "city": dealer["city"],
+            "state": dealer["state"],
+        },
+        "vin": parsed["vin"],
+        "vdp_url": parsed["url"],
+        "price": parsed["price"],
+        "build": {
+            "year": year,
+            "make": make,
+            "model": model,
+            "body_type": parsed.get("body") or "",
+        },
+        "heading": title,
+        "miles": parsed.get("miles"),
+        "dist": dealer["miles"],
+        "make": make,
+        "model": model,
+        "year": year,
+        "body_type": parsed.get("body") or "",
+    }
+
+
+def read_dealer_inventory(dealer: dict) -> dict:
+    """Fetch one dealer origin and, if needed, one public inventory index."""
+    home = fetch_public(dealer["origin"])
+    if home.get("blocked"):
+        return {"status": "blocked", "dealer": dealer, "rows": []}
+    if not home.get("ok"):
+        # Published http links often redirect only on https. One same-site retry.
+        if dealer["origin"].startswith("http://"):
+            dealer = dict(dealer)
+            dealer["origin"] = "https://" + dealer["origin"][len("http://"):]
+            home = fetch_public(dealer["origin"])
+        if home.get("blocked"):
+            return {"status": "blocked", "dealer": dealer, "rows": []}
+        if not home.get("ok"):
+            status = "blocked" if home.get("blocked") else "unreachable"
+            return {"status": status, "dealer": dealer, "rows": []}
+    rows = parse_dealer_inventory(home["html"], home["url"])
+    if rows:
+        return {"status": "listings", "dealer": dealer, "rows": rows}
+    links = inventory_index_links(home["html"], home["url"])
+    if not links:
+        links = [
+            urllib.parse.urljoin(dealer["origin"], path)
+            for path in ("/newandusedcars?clearall=1", "/used-inventory/index.htm")
+        ]
+    blocked_follow = False
+    for link in links[:2]:
+        page = fetch_public(link)
+        if page.get("blocked"):
+            blocked_follow = True
+            continue
+        if not page.get("ok"):
+            continue
+        rows = parse_dealer_inventory(page["html"], page["url"])
+        if rows:
+            return {"status": "listings", "dealer": dealer, "rows": rows}
+    if blocked_follow and not rows:
+        return {"status": "blocked", "dealer": dealer, "rows": []}
+    return {"status": "empty", "dealer": dealer, "rows": []}
+
+
+def passes_filters(raw: dict, base_params: dict, radius: float) -> bool:
+    if not within_radius(raw, radius):
+        return False
+    wanted_body = base_params.get("body_type") or ""
+    if wanted_body and not body_matches(raw.get("body_type"), wanted_body):
+        return False
+    make = (base_params.get("make") or "").casefold()
+    got_make = (raw.get("make") or "").casefold()
+    heading = (raw.get("heading") or "").casefold()
+    if make and got_make != make and make not in got_make and make not in heading:
+        return False
+    wanted_model = (base_params.get("model") or "").casefold()
+    if wanted_model and wanted_model not in (raw.get("model") or "").casefold() and wanted_model not in heading:
+        return False
+    if base_params.get("year"):
+        try:
+            if int(raw.get("year") or 0) != int(base_params["year"]):
+                return False
+        except (TypeError, ValueError):
+            return False
+    miles_range = str(base_params.get("miles_range") or "")
+    if "-" in miles_range:
+        try:
+            miles_max = int(miles_range.split("-", 1)[1])
+        except ValueError:
+            miles_max = None
+        miles = as_int(raw.get("miles"))
+        if miles_max is not None and miles is not None and miles > miles_max:
+            return False
+    return True
+
+
+def search_dealer_sites(
+    base_params: dict,
+    budget: int,
+    *,
+    floor: int | None = None,
+    apply_auto_floor: bool = True,
+) -> dict:
+    """Read public inventory pages for dealerships near the ZIP."""
+    zip_code = base_params.get("zip") or ""
+    try:
+        radius = float(base_params.get("radius") or 50)
+    except (TypeError, ValueError):
+        radius = 50.0
+    point = geocode_zip(zip_code)
+    if not point:
+        return {
+            "ok": False,
+            "listings": [],
+            "blocked": [],
+            "empty": [],
+            "worked": [],
+            "error": "Couldn't look up that ZIP for nearby dealers.",
+        }
+    dealers, lookup_error = nearby_dealer_sites(point[0], point[1], radius)
+    if lookup_error:
+        return {
+            "ok": False,
+            "listings": [],
+            "blocked": [],
+            "empty": [],
+            "worked": [],
+            "error": lookup_error,
+        }
+    shortlist = dealers[:DEALER_FETCH_LIMIT]
+    kept: list[dict] = []
+    seen: set[str] = set()
+    blocked: list[str] = []
+    empty: list[str] = []
+    worked: list[str] = []
+    unreachable: list[str] = []
+
+    def take(result: dict) -> None:
+        dealer = result["dealer"]
+        status = result["status"]
+        if status == "blocked":
+            blocked.append(dealer["host"])
+            return
+        if status == "unreachable":
+            unreachable.append(dealer["host"])
+            return
+        if status != "listings":
+            empty.append(dealer["name"])
+            return
+        added = False
+        for parsed in result["rows"]:
+            raw = _raw_from_parsed(parsed, dealer)
+            if not passes_filters(raw, base_params, radius):
+                continue
+            item = normalize_listing(
+                raw, budget, floor=floor, apply_auto_floor=apply_auto_floor
+            )
+            if not item or item["vin"] in seen:
+                continue
+            # Keep the dealer's own vehicle page. Aggregator and ad hosts are dropped.
+            link_host = site_host(item["url"]).removeprefix("www.")
+            dealer_host = dealer["host"].removeprefix("www.")
+            if link_host != dealer_host and not host_is(link_host, dealer_host):
+                continue
+            item["listing_source"] = "dealer_site"
+            seen.add(item["vin"])
+            kept.append(item)
+            added = True
+        if added or result["rows"]:
+            worked.append(dealer["name"])
+
+    waves = [shortlist[i:i + DEALER_WAVE] for i in range(0, len(shortlist), DEALER_WAVE)]
+    with ThreadPoolExecutor(max_workers=DEALER_WORKERS) as pool:
+        for wave in waves:
+            if len(kept) >= RESULT_LIMIT:
+                break
+            futures = [pool.submit(read_dealer_inventory, dealer) for dealer in wave]
+            for future in as_completed(futures):
+                try:
+                    take(future.result())
+                except Exception:
+                    continue
+    return {
+        "ok": True,
+        "listings": kept,
+        "blocked": blocked,
+        "empty": empty,
+        "worked": worked,
+        "unreachable": unreachable,
+        "dealers_considered": len(shortlist),
+        "error": None,
+    }
+
+
+def listing_sort_key(item: dict, budget: int) -> tuple:
+    return (-(item.get("year") or 0), abs(budget - item["price"]), item["price"])
+
+
+def search_market(
+    base_params: dict,
+    budget: int,
+    *,
+    floor: int | None = None,
+    apply_auto_floor: bool = True,
+) -> dict:
+    """Dealer websites first. CarGurus fills in when those pages come up short."""
+    dealer = search_dealer_sites(
+        base_params, budget, floor=floor, apply_auto_floor=apply_auto_floor
+    )
+    dealer_listings = dealer.get("listings") or []
+    cg: dict = {"ok": True, "listings": [], "error": None}
+    if len(dealer_listings) < RESULT_LIMIT:
+        cg = select_listings(
+            base_params, budget, floor=floor, apply_auto_floor=apply_auto_floor
+        )
+    cg_listings = cg.get("listings") or []
+    seen = {item["vin"] for item in dealer_listings}
+    merged = list(dealer_listings)
+    for item in cg_listings:
+        item["listing_source"] = "cargurus"
+        if item["vin"] in seen:
+            continue
+        seen.add(item["vin"])
+        merged.append(item)
+    merged.sort(key=lambda item: listing_sort_key(item, budget))
+    chosen = merged[:RESULT_LIMIT]
+    dealer_in_results = any(item.get("listing_source") == "dealer_site" for item in chosen)
+    if dealer_listings and not dealer_in_results:
+        best = min(dealer_listings, key=lambda item: listing_sort_key(item, budget))
+        chosen = (chosen[: RESULT_LIMIT - 1] if len(chosen) == RESULT_LIMIT else chosen) + [best]
+        chosen.sort(key=lambda item: listing_sort_key(item, budget))
+    dealer_count = sum(1 for item in chosen if item.get("listing_source") == "dealer_site")
+    count = len(chosen)
+    noun = "listing" if count == 1 else "listings"
+    if dealer_count and dealer_count == count:
+        note = f"Found {count} dealer {noun} from nearby dealer websites."
+        source = "Nearby dealer websites"
+    elif dealer_count:
+        note = f"Found {count} dealer {noun} from nearby dealer websites and CarGurus."
+        source = "Nearby dealer websites and CarGurus"
+    elif chosen and not dealer.get("ok"):
+        reason = (dealer.get("error") or "Nearby dealer sites didn't return a public inventory page").rstrip(".")
+        note = f"Found {count} dealer {noun}. {reason}, so these are from CarGurus."
+        source = "CarGurus public dealer listings"
+    elif chosen:
+        note = (
+            f"Found {count} dealer {noun}. Nearby dealer sites didn't return a public "
+            "inventory page, so these are from CarGurus."
+        )
+        source = "CarGurus public dealer listings"
+    else:
+        note = "Found 0 dealer listings."
+        source = "Nearby dealer websites and CarGurus"
+    ok = bool(chosen) or bool(cg.get("ok")) or bool(dealer.get("ok"))
+    error = None
+    if not ok:
+        error = cg.get("error") or dealer.get("error") or "Couldn't load dealer listings."
+        note = error
+    return {
+        "ok": ok,
+        "listings": chosen if ok else [],
+        "error": error,
+        "note": note,
+        "source": source,
+        "dealer_sites_used": dealer.get("worked") or [],
+        "dealer_sites_blocked": dealer.get("blocked") or [],
+        "dealer_sites_empty": dealer.get("empty") or [],
+        "dealer_sites_unreachable": dealer.get("unreachable") or [],
+    }
+
+
 def select_listings(
     base_params: dict,
     budget: int,
@@ -682,6 +1496,7 @@ def select_listings(
             continue
         if item["vin"] in seen:
             continue
+        item["listing_source"] = "cargurus"
         seen.add(item["vin"])
         kept.append(item)
 
@@ -1062,17 +1877,15 @@ class Handler(BaseHTTPRequestHandler):
         if parsed_want.get("miles_max"):
             params["miles_range"] = f"0-{parsed_want['miles_max']}"
 
-        selected = select_listings(
+        selected = search_market(
             params, budget, floor=floor, apply_auto_floor=not user_set_min
         )
         listings = selected.get("listings") or []
-        count = len(listings)
-        noun = "listing" if count == 1 else "listings"
         result = {
             "ok": bool(selected.get("ok")),
             "listings": listings,
-            "note": f"Found {count} dealer {noun}.",
-            "source": "CarGurus public dealer listings",
+            "note": selected.get("note") or "Found 0 dealer listings.",
+            "source": selected.get("source") or "Nearby dealer websites and CarGurus",
             "filters": {
                 "budget": budget,
                 "min": min_budget,
@@ -1081,6 +1894,8 @@ class Handler(BaseHTTPRequestHandler):
                 "price_floor": floor,
                 "inventory_type": "used",
             },
+            "dealer_sites_used": selected.get("dealer_sites_used") or [],
+            "dealer_sites_blocked": selected.get("dealer_sites_blocked") or [],
         }
         if not selected.get("ok"):
             result["error"] = selected.get("error") or "Search failed."
