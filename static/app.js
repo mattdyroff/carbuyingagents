@@ -38,7 +38,7 @@ function setStatus(text, kind) {
 function renderListings(listings) {
   resultsEl.innerHTML = "";
   if (!listings.length) {
-    resultsEl.innerHTML = `<div class="empty">No dealer listings in that range. Try a higher budget or a different ZIP.</div>`;
+    resultsEl.innerHTML = `<div class="empty">No dealer listings in that range. Try a wider budget or a different ZIP.</div>`;
     return;
   }
   for (const car of listings) {
@@ -140,11 +140,28 @@ async function refreshMe() {
 form.addEventListener("submit", async (e) => {
   e.preventDefault();
   const fd = new FormData(form);
+  const minRaw = String(fd.get("min") || "").trim();
+  const maxRaw = String(fd.get("budget") || "").trim();
   const params = new URLSearchParams({
-    budget: String(fd.get("budget") || ""),
+    budget: maxRaw,
     zip: String(fd.get("zip") || ""),
     body: String(fd.get("body") || ""),
   });
+  if (minRaw !== "") {
+    const minN = Number(minRaw);
+    const maxN = Number(maxRaw);
+    if (!Number.isInteger(minN) || minN < 0) {
+      setStatus("Enter a min budget in whole dollars.", "error");
+      resultsEl.innerHTML = "";
+      return;
+    }
+    if (Number.isInteger(maxN) && minN > maxN) {
+      setStatus("Min budget can't be higher than max budget.", "error");
+      resultsEl.innerHTML = "";
+      return;
+    }
+    params.set("min", String(minN));
+  }
 
   goBtn.disabled = true;
   setStatus("Searching dealer lots…");

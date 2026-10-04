@@ -283,16 +283,27 @@ def parse_want(text: str) -> dict:
     return out
 
 
-def price_floor(budget: int) -> int:
-    """Ignore beaters and prices that are nonsense for the budget.
+def price_floor(budget: int, min_budget: int | None = None) -> int:
+    """Price floor for a search.
 
-    Always drop under $5,000. At $15,000 and up, also drop anything under
-    about 15% of the budget so a $48,000 search does not lead with a $2,000 car.
+    A min the user typed replaces the automatic floors. Otherwise drop under
+    $5,000, and at a max of $15,000 or more also drop anything under about 15%
+    of that max so a $48,000 search does not lead with a $2,000 car.
     """
+    if min_budget is not None:
+        return min_budget
     floor = ABSOLUTE_MIN_PRICE
     if budget >= 15000:
         floor = max(floor, int(budget * 0.15))
     return floor
+
+
+def parse_whole_dollars(raw: str) -> int:
+    """Whole-dollar amount. Commas and a leading $ are fine. Blank is an error."""
+    text = raw.strip().replace(",", "").replace("$", "").replace(" ", "")
+    if text.startswith("-") or not re.fullmatch(r"\d+", text):
+        raise ValueError
+    return int(text)
 
 
 def listing_year(raw: dict) -> int | None:
@@ -338,7 +349,15 @@ def is_ad_url(url: str) -> bool:
     return False
 
 
-def is_junk_price(price: int, year: int | None, budget: int) -> bool:
+def is_junk_price(
+    price: int,
+    year: int | None,
+    budget: int,
+    *,
+    apply_auto_floor: bool = True,
+) -> bool:
+    if not apply_auto_floor:
+        return False
     if price < ABSOLUTE_MIN_PRICE:
         return True
     # Nearly-new metal listed under $5,000 is bad data, not a deal.
@@ -349,7 +368,13 @@ def is_junk_price(price: int, year: int | None, budget: int) -> bool:
     return False
 
 
-def normalize_listing(raw: dict, budget: int) -> dict | None:
+def normalize_listing(
+    raw: dict,
+    budget: int,
+    *,
+    floor: int | None = None,
+    apply_auto_floor: bool = True,
+) -> dict | None:
     seller = (raw.get("seller_type") or "").strip().lower()
     if seller != "dealer":
         return None
@@ -374,9 +399,11 @@ def normalize_listing(raw: dict, budget: int) -> dict | None:
     price = as_int(raw.get("price"))
     if price is None or price > budget:
         return None
+    if floor is not None and price < floor:
+        return None
 
     year = listing_year(raw)
-    if is_junk_price(price, year, budget):
+    if is_junk_price(price, year, budget, apply_auto_floor=apply_auto_floor):
         return None
 
     heading = (raw.get("heading") or "").strip()
@@ -540,12 +567,18 @@ def cargurus_to_raw(data: dict) -> dict | None:
     }
 
 
-def search_url(base_params: dict, budget: int, make_path: str | None = None) -> str:
+def search_url(
+    base_params: dict,
+    budget: int,
+    make_path: str | None = None,
+    floor: int | None = None,
+) -> str:
     price_range = base_params.get("price_range") or ""
     if "-" in str(price_range):
         low, high = str(price_range).split("-", 1)
     else:
-        low, high = str(price_floor(budget)), str(budget)
+        low = str(floor if floor is not None else price_floor(budget))
+        high = str(budget)
     query = {
         "zip": base_params.get("zip") or "",
         "distance": base_params.get("radius") or "50",
@@ -583,9 +616,15 @@ def within_radius(raw: dict, radius: float) -> bool:
         return True
 
 
-def select_listings(base_params: dict, budget: int) -> dict:
+def select_listings(
+    base_params: dict,
+    budget: int,
+    *,
+    floor: int | None = None,
+    apply_auto_floor: bool = True,
+) -> dict:
     """Read one public results page and keep a short used-dealer set."""
-    url = search_url(base_params, budget)
+    url = search_url(base_params, budget, floor=floor)
     page = fetch_html(url)
     if not page.get("ok"):
         return {
@@ -599,7 +638,7 @@ def select_listings(base_params: dict, budget: int) -> dict:
     if make:
         path = make_paths(html).get(make)
         if path:
-            url = search_url(base_params, budget, make_path=path)
+            url = search_url(base_params, budget, make_path=path, floor=floor)
             page = fetch_html(url)
             if not page.get("ok"):
                 return {
@@ -636,7 +675,9 @@ def select_listings(base_params: dict, budget: int) -> dict:
             continue
         if wanted_model and wanted_model not in (raw.get("model") or "").casefold():
             continue
-        item = normalize_listing(raw, budget)
+        item = normalize_listing(
+            raw, budget, floor=floor, apply_auto_floor=apply_auto_floor
+        )
         if not item:
             continue
         if item["vin"] in seen:
@@ -934,6 +975,7 @@ class Handler(BaseHTTPRequestHandler):
             return (vals[0] if vals else default).strip()
 
         budget_s = one("budget")
+        min_s = one("min")
         zip_code = one("zip")
         body_style = one("body")
         want = one("want")
@@ -942,7 +984,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(400, {"ok": False, "error": "Enter a valid 5-digit US ZIP code.", "listings": []})
 
         try:
-            budget = int(re.sub(r"[^\d]", "", budget_s))
+            budget = parse_whole_dollars(budget_s)
             if budget <= 0:
                 raise ValueError
         except ValueError:
@@ -950,6 +992,25 @@ class Handler(BaseHTTPRequestHandler):
                 400,
                 {"ok": False, "error": "Enter a max budget in USD (whole dollars).", "listings": []},
             )
+
+        min_budget = None
+        if min_s:
+            try:
+                min_budget = parse_whole_dollars(min_s)
+            except ValueError:
+                return self._json(
+                    400,
+                    {"ok": False, "error": "Enter a min budget in USD (whole dollars).", "listings": []},
+                )
+            if min_budget > budget:
+                return self._json(
+                    400,
+                    {
+                        "ok": False,
+                        "error": "Min budget can't be higher than max budget.",
+                        "listings": [],
+                    },
+                )
 
         parsed_want = parse_want(want)
         body = body_style.lower()
@@ -965,8 +1026,11 @@ class Handler(BaseHTTPRequestHandler):
         if not body and not body_style:
             body = parsed_want.get("body_type", "")
 
-        floor = price_floor(budget)
-        if floor >= budget:
+        user_set_min = min_budget is not None
+        floor = price_floor(budget, min_budget)
+        # Automatic floor can sit above a tiny max. An explicit min equal to
+        # the max is a real search for that exact price.
+        if not user_set_min and floor >= budget:
             result = {
                 "ok": True,
                 "listings": [],
@@ -974,6 +1038,7 @@ class Handler(BaseHTTPRequestHandler):
                 "source": "CarGurus public dealer listings",
                 "filters": {
                     "budget": budget,
+                    "min": None,
                     "zip": zip_code,
                     "body": body or None,
                     "price_floor": floor,
@@ -997,7 +1062,9 @@ class Handler(BaseHTTPRequestHandler):
         if parsed_want.get("miles_max"):
             params["miles_range"] = f"0-{parsed_want['miles_max']}"
 
-        selected = select_listings(params, budget)
+        selected = select_listings(
+            params, budget, floor=floor, apply_auto_floor=not user_set_min
+        )
         listings = selected.get("listings") or []
         count = len(listings)
         noun = "listing" if count == 1 else "listings"
@@ -1008,6 +1075,7 @@ class Handler(BaseHTTPRequestHandler):
             "source": "CarGurus public dealer listings",
             "filters": {
                 "budget": budget,
+                "min": min_budget,
                 "zip": zip_code,
                 "body": body or None,
                 "price_floor": floor,

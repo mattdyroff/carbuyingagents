@@ -30,12 +30,16 @@
       <form id="search-form" class="search-card">
         <div class="search-card-head">
           <h2>Search</h2>
-          <p>ZIP, max budget, optional body style.</p>
+          <p>ZIP, min and max budget, optional body style.</p>
         </div>
         <div class="grid">
           <label>
             ZIP code
             <input name="zip" type="text" inputmode="numeric" pattern="[0-9]{5}" minlength="5" maxlength="5" placeholder="02332" title="5-digit ZIP, leading zeros ok" required autocomplete="postal-code" />
+          </label>
+          <label>
+            Min budget <span class="opt">optional</span>
+            <input name="min" type="number" inputmode="numeric" min="0" step="1" placeholder="10000" />
           </label>
           <label>
             Max budget
