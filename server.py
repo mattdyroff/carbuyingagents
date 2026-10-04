@@ -1353,6 +1353,445 @@ def search_dealer_sites(
     }
 
 
+DETAIL_TIMEOUT = 4
+NHTSA_RECALLS = "https://api.nhtsa.gov/recalls/recallsByVehicle"
+NHTSA_RATINGS = "https://api.nhtsa.gov/SafetyRatings"
+NHTSA_DECODE = "https://vpic.nhtsa.dot.gov/api/vehicles/DecodeVinValues"
+EPA_VEHICLE = "https://www.fueleconomy.gov/ws/rest/vehicle"
+_DETAIL_LOCK = threading.Lock()
+_RECALL_CACHE: dict[str, str] = {}
+_CRASH_CACHE: dict[str, str] = {}
+_MPG_CACHE: dict[str, str] = {}
+_CACHE_MISS = object()
+
+
+def fetch_json(url: str, timeout: float = DETAIL_TIMEOUT) -> tuple[int | None, dict | None]:
+    req = urllib.request.Request(
+        url,
+        headers={"User-Agent": UA, "Accept": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            status = getattr(resp, "status", 200)
+            payload = resp.read()
+    except urllib.error.HTTPError as err:
+        status = err.code
+        try:
+            payload = err.read()
+        except Exception:
+            return status, None
+    except Exception:
+        return None, None
+    try:
+        data = json.loads(payload.decode("utf-8", "replace"))
+    except (json.JSONDecodeError, UnicodeError):
+        return status, None
+    if not isinstance(data, dict):
+        return status, None
+    return status, data
+
+
+def _cache_get(cache: dict, key: str):
+    with _DETAIL_LOCK:
+        return cache.get(key, _CACHE_MISS)
+
+
+def _cache_put(cache: dict, key: str, value: str) -> None:
+    with _DETAIL_LOCK:
+        cache[key] = value
+
+
+def _compact(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", (value or "").casefold())
+
+
+def _best_name(wanted: str, options: list[str]) -> str | None:
+    target = _compact(wanted)
+    if not target:
+        return None
+    usable = [name for name in options if name and _compact(name)]
+    exact = [name for name in usable if _compact(name) == target]
+    if exact:
+        return exact[0]
+    prefix = [
+        name for name in usable
+        if _compact(name).startswith(target) or target.startswith(_compact(name))
+    ]
+    pool = prefix or [
+        name for name in usable
+        if target in _compact(name) or _compact(name) in target
+    ]
+    if not pool:
+        return None
+    pool.sort(key=lambda name: (abs(len(_compact(name)) - len(target)), len(name), name.casefold()))
+    return pool[0]
+
+
+def _money_whole(amount: int) -> str:
+    return f"${amount:,}"
+
+
+def payment_line(price) -> str | None:
+    if isinstance(price, bool) or not isinstance(price, (int, float)):
+        return None
+    principal = int(price)
+    if principal <= 0:
+        return None
+    monthly_rate = 0.07 / 12
+    months = 60
+    growth = (1 + monthly_rate) ** months
+    payment = principal * monthly_rate * growth / (growth - 1)
+    shown = int(payment + 0.5)
+    return f"{_money_whole(shown)}/mo estimate, 60 months at 7%, before tax and fees"
+
+
+def consumer_notes(item: dict, budget: int) -> list[str]:
+    notes: list[str] = []
+    year = item.get("year")
+    miles = item.get("mileage")
+    if isinstance(year, int) and not isinstance(year, bool) and isinstance(miles, int) and not isinstance(miles, bool):
+        age = CURRENT_YEAR - year
+        if age >= 1 and miles > 15000 * age:
+            notes.append(f"High miles for a {year}")
+    price = item.get("price")
+    if (
+        isinstance(price, int)
+        and not isinstance(price, bool)
+        and isinstance(budget, int)
+        and budget > 0
+        and price * 20 >= budget * 19
+    ):
+        notes.append("At the top of your budget")
+    return notes
+
+
+def _menu_pairs(data: dict | None) -> list[tuple[str, str]]:
+    if not isinstance(data, dict):
+        return []
+    raw = data.get("menuItem")
+    if isinstance(raw, dict):
+        raw = [raw]
+    if not isinstance(raw, list):
+        return []
+    pairs = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        text = str(item.get("text") or item.get("value") or "").strip()
+        value = str(item.get("value") or item.get("text") or "").strip()
+        if text and value:
+            pairs.append((text, value))
+    return pairs
+
+
+def _recall_sentence(data: dict) -> str | None:
+    results = data.get("results")
+    if not isinstance(results, list):
+        return None
+    campaigns: list[str] = []
+    seen: set[str] = set()
+    for row in results:
+        if not isinstance(row, dict):
+            continue
+        number = str(row.get("NHTSACampaignNumber") or "").strip()
+        if not number or number in seen:
+            continue
+        seen.add(number)
+        campaigns.append(number)
+    if not campaigns:
+        if results:
+            return None
+        return "No open recalls"
+    campaigns.sort()
+    label = "open recall" if len(campaigns) == 1 else "open recalls"
+    return f"{len(campaigns)} {label} ({', '.join(campaigns)})"
+
+
+def _recalls_for_vehicle(make: str, model: str, year: int) -> str | None:
+    query = urllib.parse.urlencode({"make": make, "model": model, "modelYear": str(year)})
+    status, data = fetch_json(f"{NHTSA_RECALLS}?{query}")
+    if status != 200 or not isinstance(data, dict):
+        return None
+    return _recall_sentence(data)
+
+
+def _vin_identity(vin: str) -> tuple[int | None, str, str]:
+    status, data = fetch_json(f"{NHTSA_DECODE}/{urllib.parse.quote(vin)}?format=json")
+    if status != 200 or not isinstance(data, dict):
+        return None, "", ""
+    rows = data.get("Results")
+    if not isinstance(rows, list) or not rows or not isinstance(rows[0], dict):
+        return None, "", ""
+    row = rows[0]
+    return as_int(row.get("ModelYear")), (row.get("Make") or "").strip(), (row.get("Model") or "").strip()
+
+
+def _load_recalls(item: dict) -> str | None:
+    """recallsByVin is not a live api.nhtsa.gov route, so the VIN is decoded and recallsByVehicle is used."""
+    vin = (item.get("vin") or "").strip().upper()
+    decoded_year, decoded_make, decoded_model = _vin_identity(vin)
+    candidates: list[tuple[str, str, int]] = []
+    if decoded_year and decoded_make and decoded_model:
+        candidates.append((decoded_make, decoded_model, decoded_year))
+    year = item.get("year") if isinstance(item.get("year"), int) else None
+    make = (item.get("make") or "").strip()
+    model = (item.get("model") or "").strip()
+    if year and make and model:
+        pair = (make, model, year)
+        if pair not in candidates:
+            candidates.append(pair)
+    for make_name, model_name, model_year in candidates:
+        line = _recalls_for_vehicle(make_name, model_name, model_year)
+        if line is not None:
+            return line
+    return None
+
+
+def recall_line(item: dict) -> str | None:
+    vin = (item.get("vin") or "").strip().upper()
+    if not is_real_vin(vin):
+        return None
+    cached = _cache_get(_RECALL_CACHE, vin)
+    if cached is not _CACHE_MISS:
+        return cached or None
+    line = _load_recalls(item)
+    if line is None:
+        return None
+    _cache_put(_RECALL_CACHE, vin, line)
+    return line
+
+
+def _star_line(rating) -> str | None:
+    text = str(rating or "").strip()
+    if not text.isdigit():
+        return None
+    stars = int(text)
+    if stars < 1 or stars > 5:
+        return None
+    word = "star" if stars == 1 else "stars"
+    return f"Crash rating: {stars} {word}"
+
+
+def _rating_rows(data: dict | None) -> list[dict]:
+    if not isinstance(data, dict):
+        return []
+    rows = data.get("Results")
+    if not isinstance(rows, list):
+        return []
+    return [row for row in rows if isinstance(row, dict)]
+
+
+def _vehicle_ids(rows: list[dict]) -> list[int]:
+    ids: list[int] = []
+    for row in rows:
+        try:
+            vid = int(row.get("VehicleId"))
+        except (TypeError, ValueError):
+            continue
+        if vid > 0 and vid not in ids:
+            ids.append(vid)
+    return ids
+
+
+def _rating_from_rows(rows: list[dict]) -> str | None:
+    for row in rows:
+        line = _star_line(row.get("OverallRating"))
+        if line:
+            return line
+    ids = _vehicle_ids(rows)[:3]
+    if not ids:
+        return ""
+    saw_ok = False
+    for vid in ids:
+        status, data = fetch_json(f"{NHTSA_RATINGS}/VehicleId/{vid}")
+        if status != 200:
+            continue
+        saw_ok = True
+        for row in _rating_rows(data):
+            line = _star_line(row.get("OverallRating"))
+            if line:
+                return line
+    if not saw_ok:
+        return None
+    return ""
+
+
+def _load_crash(year: int, make: str, model: str) -> str | None:
+    make_path = urllib.parse.quote(make, safe="")
+    model_path = urllib.parse.quote(model, safe="")
+    status, data = fetch_json(f"{NHTSA_RATINGS}/modelyear/{year}/make/{make_path}/model/{model_path}")
+    if status is None:
+        return None
+    if status == 200:
+        rows = _rating_rows(data)
+        if rows:
+            return _rating_from_rows(rows)
+    list_status, listed = fetch_json(f"{NHTSA_RATINGS}/modelyear/{year}/make/{make_path}")
+    if list_status is None:
+        return None
+    if list_status != 200:
+        return ""
+    names = [str(row.get("Model") or "").strip() for row in _rating_rows(listed)]
+    picked = _best_name(model, [name for name in names if name])
+    if not picked or _compact(picked) == _compact(model):
+        return ""
+    picked_path = urllib.parse.quote(picked, safe="")
+    status, data = fetch_json(f"{NHTSA_RATINGS}/modelyear/{year}/make/{make_path}/model/{picked_path}")
+    if status is None:
+        return None
+    if status != 200:
+        return ""
+    line = _rating_from_rows(_rating_rows(data))
+    if line is None:
+        return None
+    return line
+
+
+def crash_line(item: dict) -> str | None:
+    year = item.get("year")
+    make = (item.get("make") or "").strip()
+    model = (item.get("model") or "").strip()
+    if not isinstance(year, int) or isinstance(year, bool) or not make or not model:
+        return None
+    key = f"{year}|{_compact(make)}|{_compact(model)}"
+    cached = _cache_get(_CRASH_CACHE, key)
+    if cached is not _CACHE_MISS:
+        return cached or None
+    line = _load_crash(year, make, model)
+    if line is None:
+        return None
+    _cache_put(_CRASH_CACHE, key, line)
+    return line or None
+
+
+def _load_mpg(year: int, make: str, model: str) -> str | None:
+    status, data = fetch_json(f"{EPA_VEHICLE}/menu/make?year={year}")
+    if status is None:
+        return None
+    if status != 200:
+        return ""
+    makes = [text for text, _value in _menu_pairs(data)]
+    make_name = _best_name(make, makes)
+    if not make_name:
+        return ""
+    query = urllib.parse.urlencode({"year": year, "make": make_name})
+    status, data = fetch_json(f"{EPA_VEHICLE}/menu/model?{query}")
+    if status is None:
+        return None
+    if status != 200:
+        return ""
+    models = [text for text, _value in _menu_pairs(data)]
+    model_name = _best_name(model, models)
+    if not model_name:
+        return ""
+    query = urllib.parse.urlencode({"year": year, "make": make_name, "model": model_name})
+    status, data = fetch_json(f"{EPA_VEHICLE}/menu/options?{query}")
+    if status is None:
+        return None
+    if status != 200:
+        return ""
+    pairs = _menu_pairs(data)
+    if not pairs:
+        return ""
+    vehicle_id = pairs[0][1]
+    if not vehicle_id.isdigit():
+        return ""
+    status, record = fetch_json(f"{EPA_VEHICLE}/{vehicle_id}")
+    if status is None:
+        return None
+    if status != 200 or not isinstance(record, dict):
+        return ""
+    nested = record.get("vehicle")
+    if isinstance(nested, dict):
+        record = nested
+    try:
+        mpg = int(float(record.get("comb08")))
+    except (TypeError, ValueError):
+        return ""
+    if mpg <= 0:
+        return ""
+    return f"{mpg} mpg combined"
+
+
+def mpg_line(item: dict) -> str | None:
+    year = item.get("year")
+    make = (item.get("make") or "").strip()
+    model = (item.get("model") or "").strip()
+    if not isinstance(year, int) or isinstance(year, bool) or not make or not model:
+        return None
+    key = f"{year}|{_compact(make)}|{_compact(model)}"
+    cached = _cache_get(_MPG_CACHE, key)
+    if cached is not _CACHE_MISS:
+        return cached or None
+    line = _load_mpg(year, make, model)
+    if line is None:
+        return None
+    _cache_put(_MPG_CACHE, key, line)
+    return line or None
+
+
+def _lookup_public_details(item: dict) -> tuple[str | None, str | None, str | None]:
+    recalls = crash = mpg = None
+
+    def run(kind: str):
+        if kind == "recalls":
+            return recall_line(item)
+        if kind == "crash":
+            return crash_line(item)
+        return mpg_line(item)
+
+    try:
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            futures = {pool.submit(run, kind): kind for kind in ("recalls", "crash", "mpg")}
+            for future in as_completed(futures):
+                kind = futures[future]
+                try:
+                    value = future.result()
+                except Exception:
+                    value = None
+                if kind == "recalls":
+                    recalls = value
+                elif kind == "crash":
+                    crash = value
+                else:
+                    mpg = value
+    except Exception:
+        return None, None, None
+    return recalls, crash, mpg
+
+
+def _attach_one(item: dict, budget: int) -> None:
+    payment = payment_line(item.get("price"))
+    notes = consumer_notes(item, budget)
+    if payment:
+        item["payment"] = payment
+    if notes:
+        item["notes"] = notes
+    recalls, crash, mpg = _lookup_public_details(item)
+    if recalls:
+        item["recalls"] = recalls
+    if crash:
+        item["crash_rating"] = crash
+    if mpg:
+        item["mpg"] = mpg
+
+
+def attach_consumer_details(listings: list[dict], budget: int) -> None:
+    """Add free consumer lines to the cars that will be shown. A failed lookup is left off."""
+    if not listings:
+        return
+
+    def safe(item: dict) -> None:
+        try:
+            _attach_one(item, budget)
+        except Exception:
+            return
+
+    workers = min(8, len(listings))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        list(pool.map(safe, listings))
+
+
 def listing_sort_key(item: dict, budget: int) -> tuple:
     return (-(item.get("year") or 0), abs(budget - item["price"]), item["price"])
 
@@ -1417,6 +1856,11 @@ def search_market(
     if not ok:
         error = cg.get("error") or dealer.get("error") or "Couldn't load dealer listings."
         note = error
+    if ok and chosen:
+        try:
+            attach_consumer_details(chosen, budget)
+        except Exception:
+            pass
     return {
         "ok": ok,
         "listings": chosen if ok else [],

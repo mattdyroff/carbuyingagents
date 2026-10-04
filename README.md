@@ -22,6 +22,8 @@ Both budget fields take any whole-dollar amount. ZIP is a 5-digit text field so 
 
 Results are sorted by newer year, then closest to the max budget, and capped at 8 cars.
 
+Each result adds a monthly payment estimate (60 months at 7%, before tax and fees). When the free public sources have them, the card also shows open NHTSA recalls for that VIN, the NHTSA crash-test rating, and EPA combined fuel economy. A car with high miles for its age, or a price at the top of the max budget, gets a short note.
+
 Leaving body blank searches all body styles. The page defaults the menu to SUV.
 
 If a listing site blocks the request or doesn't return a page, search says so in plain language instead of showing the upstream error.

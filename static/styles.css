@@ -277,6 +277,13 @@ button.ghost {
   line-height: 1.45;
 }
 
+.detail {
+  margin: 0.12rem 0 0;
+  color: var(--muted);
+  font-size: 0.92rem;
+  line-height: 1.45;
+}
+
 .listing a {
   display: inline-block;
   margin-top: 0.65rem;

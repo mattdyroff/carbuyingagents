@@ -59,7 +59,24 @@ function renderListings(listings) {
     link.rel = "noopener noreferrer";
     link.href = car.url;
     link.textContent = "View listing";
-    el.append(title, price, meta, link);
+    el.append(title, price, meta);
+    const lines = [];
+    if (car.payment) lines.push(car.payment);
+    if (car.recalls) lines.push(car.recalls);
+    if (car.crash_rating) lines.push(car.crash_rating);
+    if (car.mpg) lines.push(car.mpg);
+    if (Array.isArray(car.notes)) {
+      for (const note of car.notes) {
+        if (note) lines.push(note);
+      }
+    }
+    for (const text of lines) {
+      const detail = document.createElement("p");
+      detail.className = "detail";
+      detail.textContent = text;
+      el.appendChild(detail);
+    }
+    el.append(link);
     resultsEl.appendChild(el);
   }
 }
