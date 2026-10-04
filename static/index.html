@@ -35,11 +35,11 @@
         <div class="grid">
           <label>
             ZIP code
-            <input name="zip" type="text" inputmode="numeric" pattern="\d{5}" maxlength="5" placeholder="02332" required autocomplete="postal-code" />
+            <input name="zip" type="text" inputmode="numeric" pattern="[0-9]{5}" minlength="5" maxlength="5" placeholder="02332" title="5-digit ZIP, leading zeros ok" required autocomplete="postal-code" />
           </label>
           <label>
             Max budget
-            <input name="budget" type="number" min="1" step="500" placeholder="48000" required />
+            <input name="budget" type="number" inputmode="numeric" min="1" step="1" placeholder="48000" required />
           </label>
           <label>
             Body <span class="opt">optional</span>
