@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Dealer car search. Reads nearby dealer inventory pages, then CarGurus if those pages do not fill the list."""
+"""Dealer car search. Reads nearby dealer inventory pages."""
 
 from __future__ import annotations
 
@@ -1883,58 +1883,26 @@ def search_market(
     floor: int | None = None,
     apply_auto_floor: bool = True,
 ) -> dict:
-    """Dealer websites first. CarGurus fills in when those pages come up short."""
+    """Cars from nearby dealer websites only."""
     dealer = search_dealer_sites(
         base_params, budget, floor=floor, apply_auto_floor=apply_auto_floor
     )
-    dealer_listings = dealer.get("listings") or []
-    cg: dict = {"ok": True, "listings": [], "error": None}
-    if len(dealer_listings) < RESULT_LIMIT:
-        cg = select_listings(
-            base_params, budget, floor=floor, apply_auto_floor=apply_auto_floor
-        )
-    cg_listings = cg.get("listings") or []
-    seen = {item["vin"] for item in dealer_listings}
-    merged = list(dealer_listings)
-    for item in cg_listings:
-        item["listing_source"] = "cargurus"
-        if item["vin"] in seen:
-            continue
-        seen.add(item["vin"])
-        merged.append(item)
-    merged.sort(key=lambda item: listing_sort_key(item, budget))
-    chosen = merged[:RESULT_LIMIT]
-    dealer_in_results = any(item.get("listing_source") == "dealer_site" for item in chosen)
-    if dealer_listings and not dealer_in_results:
-        best = min(dealer_listings, key=lambda item: listing_sort_key(item, budget))
-        chosen = (chosen[: RESULT_LIMIT - 1] if len(chosen) == RESULT_LIMIT else chosen) + [best]
-        chosen.sort(key=lambda item: listing_sort_key(item, budget))
-    dealer_count = sum(1 for item in chosen if item.get("listing_source") == "dealer_site")
+    dealer_listings = list(dealer.get("listings") or [])
+    dealer_listings.sort(key=lambda item: listing_sort_key(item, budget))
+    chosen = dealer_listings[:RESULT_LIMIT]
     count = len(chosen)
     noun = "listing" if count == 1 else "listings"
-    if dealer_count and dealer_count == count:
+    source = "Nearby dealer websites"
+    if chosen:
         note = f"Found {count} dealer {noun} from nearby dealer websites."
-        source = "Nearby dealer websites"
-    elif dealer_count:
-        note = f"Found {count} dealer {noun} from nearby dealer websites and CarGurus."
-        source = "Nearby dealer websites and CarGurus"
-    elif chosen and not dealer.get("ok"):
-        reason = (dealer.get("error") or "Nearby dealer sites didn't return a public inventory page").rstrip(".")
-        note = f"Found {count} dealer {noun}. {reason}, so these are from CarGurus."
-        source = "CarGurus public dealer listings"
-    elif chosen:
-        note = (
-            f"Found {count} dealer {noun}. Nearby dealer sites didn't return a public "
-            "inventory page, so these are from CarGurus."
-        )
-        source = "CarGurus public dealer listings"
+    elif not dealer.get("ok"):
+        note = dealer.get("error") or "Couldn't look up nearby dealer websites."
     else:
-        note = "Found 0 dealer listings."
-        source = "Nearby dealer websites and CarGurus"
-    ok = bool(chosen) or bool(cg.get("ok")) or bool(dealer.get("ok"))
+        note = "Found 0 dealer listings. Nearby dealer sites didn't return a public inventory page."
+    ok = bool(dealer.get("ok"))
     error = None
     if not ok:
-        error = cg.get("error") or dealer.get("error") or "Couldn't load dealer listings."
+        error = dealer.get("error") or "Couldn't load dealer listings."
         note = error
     if ok and chosen:
         try:
@@ -2374,7 +2342,7 @@ class Handler(BaseHTTPRequestHandler):
                 "ok": True,
                 "listings": [],
                 "note": "Found 0 dealer listings.",
-                "source": "CarGurus public dealer listings",
+                "source": "Nearby dealer websites",
                 "filters": {
                     "budget": budget,
                     "min": None,
@@ -2409,7 +2377,7 @@ class Handler(BaseHTTPRequestHandler):
             "ok": bool(selected.get("ok")),
             "listings": listings,
             "note": selected.get("note") or "Found 0 dealer listings.",
-            "source": selected.get("source") or "Nearby dealer websites and CarGurus",
+            "source": selected.get("source") or "Nearby dealer websites",
             "filters": {
                 "budget": budget,
                 "min": min_budget,
